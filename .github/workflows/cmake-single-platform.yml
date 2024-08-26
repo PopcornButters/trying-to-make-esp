@@ -131,3 +131,178 @@ class Visuals(threading.Thread):
                     prev_frame_time = new_frame_time
                     if cfg.show_window:
                         cv2.putText(self.image, f'FPS: {str(int(fps))}', (10, 80) if cfg.show_detection_speed else (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1
+# logic/overlay.py
+
+import cv2
+import numpy as np
+
+# Create a global overlay image
+overlay_image = None
+
+def show(width, height):
+    global overlay_image
+    overlay_image = np.zeros((height, width, 3), dtype=np.uint8)
+
+def draw_line(x1, y1, x2, y2, color, thickness):
+    global overlay_image
+    if overlay_image is not None:
+        color_map = {'green': (0, 255, 0), 'red': (0, 0, 255)}
+        cv2.line(overlay_image, (x1, y1), (x2, y2), color_map.get(color, (255, 255, 255)), thickness)
+
+def draw_square(x1, y1, x2, y2, color, thickness):
+    global overlay_image
+    if overlay_image is not None:
+        color_map = {'green': (0, 255, 0), 'red': (0, 0, 255)}
+        cv2.rectangle(overlay_image, (x1, y1), (x2, y2), color_map.get(color, (255, 255, 255)), thickness)
+
+def draw_text(x, y, text):
+    global overlay_image
+    if overlay_image is not None:
+        cv2.putText(overlay_image, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # logic/capture.py
+
+# Define the center of the screen
+screen_x_center = 400
+screen_y_center = 300
+
+# visuals.py
+
+import queue
+import threading
+import time
+import cv2
+import torch
+import win32gui, win32con
+
+from logic.config_watcher import cfg
+from logic.capture import capture
+from logic.overlay import overlay
+
+class Visuals(threading.Thread):
+    def __init__(self):
+        super(Visuals, self).__init__()
+        self.queue = queue.Queue(maxsize=1)
+        self.daemon = True
+        self.name = 'Visuals'
+        self.image = None
+        
+        overlay.show(cfg.detection_window_width, cfg.detection_window_height)
+        
+        if cfg.show_window:
+            self.interpolation = cv2.INTER_NEAREST
+        
+        self.draw_line_data = None
+        self.draw_predicted_position_data = None
+        self.draw_boxes_data = None
+        self.draw_speed_data = None
+        self.draw_bScope_data = None
+        self.draw_history_point_data = []
+        self.cls_model_data = {
+            0: 'player',
+            1: 'bot',
+            2: 'weapon',
+            3: 'outline',
+            4: 'dead_body',
+            5: 'hideout_target_human',
+            6: 'hideout_target_balls',
+            7: 'head',
+            8: 'smoke',
+            9: 'fire',
+            10: 'third_person'
+        }
+        
+        self.disabled_line_classes = [2, 3, 4, 8, 9, 10]
+        self.start()
+    
+    def run(self):
+        if cfg.show_window:
+            self.spawn_debug_window()
+            prev_frame_time, new_frame_time = 0, 0 if cfg.show_window_fps else None
+        
+        while True:
+            try:
+                self.image = self.queue.get()
+                
+                if self.image is None:
+                    self.destroy()
+                    break
+
+                # Simple line
+                if self.draw_line_data:
+                    if cfg.show_window and cfg.show_target_line:
+                        cv2.line(self.image, (capture.screen_x_center, capture.screen_y_center), (int(self.draw_line_data[0]), int(self.draw_line_data[1])), (0, 255, 255), 2)
+                    
+                    if cfg.show_overlay and cfg.overlay_show_target_line:
+                        overlay.draw_line(capture.screen_x_center, capture.screen_y_center, int(self.draw_line_data[0]), int(self.draw_line_data[1]), 'green', 2)
+
+                # Boxes
+                if self.draw_boxes_data: 
+                    for item in self.draw_boxes_data:
+                        if item:
+                            for xyxy, cls, conf in zip(item.xyxy, item.cls, item.conf):
+                                x0, y0, x1, y1 = map(int, map(torch.Tensor.item, xyxy))
+                                
+                                if cfg.show_window and cfg.show_boxes:
+                                    cv2.rectangle(self.image, (x0, y0), (x1, y1), (0, 200, 0), 2)
+                                    
+                                if cfg.show_overlay and cfg.overlay_show_boxes:
+                                    overlay.draw_square(x0, y0, x1, y1, 'green', 2)
+                                    
+                                str_cls = self.cls_model_data.get(cls.item(), '')
+                                
+                                # cv2 labels
+                                if cfg.show_window and cfg.show_labels and not cfg.show_conf:
+                                    cv2.putText(self.image, str_cls, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 0), 1, cv2.LINE_AA)
+                                
+                                # Format conf text for cv2 and overlay
+                                if cfg.show_window or cfg.show_overlay:
+                                    conf_text = '{} {:.2f}'.format(str_cls, conf.item())
+                                
+                                # cv2 conf
+                                if cfg.show_window and cfg.show_conf:
+                                    cv2.putText(self.image, conf_text, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 0), 1, cv2.LINE_AA)
+                                
+                                if cfg.show_overlay and (cfg.overlay_show_conf or cfg.overlay_show_labels):
+                                    x_out, y_out = 0, 0
+                                    
+                                    if y0 <= 15:
+                                        x_out = x0 - 45
+                                        y_out = y0 + 15
+                                    else:
+                                        x_out = x0 + 45
+                                        y_out = y0 - 15
+                                    
+                                    if x0 <= 40:
+                                        x_out = x0 + 40
+                                    
+                                    if x0 >= cfg.detection_window_width - 80:
+                                        x_out = x0 - 40
+
+                                    # Overlay conf
+                                    if cfg.overlay_show_conf:
+                                        overlay.draw_text(x_out, y_out, conf_text)
+
+                                    # Overlay labels
+                                    if cfg.overlay_show_labels and not cfg.overlay_show_conf:
+                                        overlay.draw_text(x_out, y_out, str_cls)
+                                    
+                # Speed
+                if self.draw_speed_data:
+                    if cfg.show_window:
+                        cv2.putText(self.image, 'preprocess: {:.2f}'.format(self.draw_speed_data[0]), (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+                        cv2.putText(self.image, 'inference: {:.2f}'.format(self.draw_speed_data[1]), (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+                        cv2.putText(self.image, 'postprocess: {:.2f}'.format(self.draw_speed_data[2]), (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+                
+                # FPS
+                if cfg.show_window_fps:
+                    new_frame_time = time.time()
+                    fps = 1 / (new_frame_time - prev_frame_time)
+                    prev_frame_time = new_frame_time
+                    if cfg.show_window:
+                        cv2.putText(self.image, f'FPS: {str(int(fps))}', (10, 80) if cfg.show_detection_speed else (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+
+                # bScope
+                if self.draw_bScope_data:
+                    b_x1, b_x2, b_y1,
+
